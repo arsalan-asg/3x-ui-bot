@@ -127,6 +127,59 @@ def api_post(path, data):
             return _req("POST", path, data)
         raise
 
+# نسخه‌های مختلف 3x-ui/x-ui از مسیرهای متفاوتی برای «نوشتن» (اضافه/ویرایش
+# کلاینت) استفاده می‌کنن. برخلاف مسیر خواندن (inbounds/list) که یکبار تعیین
+# میشه، اینجا هر مسیر رو مستقل امتحان می‌کنیم بدون این‌که پایه‌ی سراسری API
+# رو خراب کنیم (چون یه 404 توی این endpoint به این معنی نیست که کل پایه غلطه).
+_CLIENT_WRITE_PATHS = [
+    ("rel", "inbounds/addClient"),           # 3x-ui جدید: /panel/api/inbounds/addClient
+    ("abs", "panel/inbound/addClient"),      # x-ui قدیمی‌تر: /panel/inbound/addClient
+    ("abs", "xui/API/inbounds/addClient"),   # x-ui خیلی قدیمی
+]
+_client_write_index = 0
+
+def api_post_client_write(payload):
+    """
+    برای اضافه‌کردن/ویرایش/حذف کلاینت (که همه از همون endpoint استفاده
+    می‌کنن) — چند مسیر شناخته‌شده رو امتحان می‌کنه، اولین مسیری که موفق شد
+    رو برای دفعات بعد به خاطر می‌سپاره تا دیگه لازم نباشه دوباره امتحان کنه.
+    """
+    global _client_write_index
+    order = [_client_write_index] + [i for i in range(len(_CLIENT_WRITE_PATHS)) if i != _client_write_index]
+    last_err = None
+    for i in order:
+        kind, path = _CLIENT_WRITE_PATHS[i]
+        url = f"{API()}/{path}" if kind == "rel" else f"{PANEL_URL}/{path}"
+        try:
+            if PANEL_API_TOKEN:
+                sep = "&" if "?" in url else "?"
+                url_full = f"{url}{sep}api_token={urllib.parse.quote(PANEL_API_TOKEN, safe='')}"
+            else:
+                url_full = url
+            h = {"Content-Type": "application/json"}
+            if PANEL_API_TOKEN:
+                h["Authorization"] = f"Bearer {PANEL_API_TOKEN}"
+            body = json.dumps(payload).encode()
+            req = urllib.request.Request(url_full, data=body, headers=h, method="POST")
+            _ensure_opener()
+            with _opener.open(req, timeout=30) as r:
+                result = json.loads(r.read().decode())
+            if i != _client_write_index:
+                print(f"✅ مسیر نوشتن کلاینت پیدا شد: {path}")
+                _client_write_index = i
+            return result
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                last_err = e
+                continue
+            if e.code in (401, 403) and not PANEL_API_TOKEN:
+                panel_login()
+                continue
+            raise
+    if last_err:
+        last_err.msg = f"{last_err.msg} :: هیچ‌کدوم از مسیرهای شناخته‌شده‌ی addClient جواب ندادن"
+        raise last_err
+
 # ───────────────────────── توابع پنل ─────────────────────────
 def safe_json(val, default=None):
     """
@@ -180,7 +233,7 @@ def add_client(inbound, email, total_gb, days, limit_ip=0):
     clients.append(new_client)
     settings["clients"] = clients
     payload = {"id": inbound.get("id"), "settings": json.dumps(settings)}
-    r = api_post("inbounds/addClient", payload)
+    r = api_post_client_write(payload)
     return r.get("success", False), new_client, sub_id
 
 def remove_client(inbound, email):
@@ -188,7 +241,7 @@ def remove_client(inbound, email):
     clients = [c for c in settings.get("clients", []) if c.get("email") != email]
     settings["clients"] = clients
     payload = {"id": inbound.get("id"), "settings": json.dumps(settings)}
-    r = api_post("inbounds/addClient", payload)
+    r = api_post_client_write(payload)
     return r.get("success", False)
 
 def list_clients(inbound):
@@ -233,7 +286,7 @@ def toggle_client_enable(inbound, email):
         return None
     settings["clients"] = clients
     payload = {"id": inbound.get("id"), "settings": json.dumps(settings)}
-    r = api_post("inbounds/addClient", payload)
+    r = api_post_client_write(payload)
     return target if r.get("success", False) else None
 
 # ───────────────────────── ساخت لینک vless ─────────────────────────
