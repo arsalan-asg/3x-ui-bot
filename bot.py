@@ -35,7 +35,18 @@ PANEL_API_TOKEN = os.environ.get("PANEL_API_TOKEN", "")
 PANEL_USERNAME = os.environ.get("PANEL_USERNAME", "")
 PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "")
 PANEL_INBOUND_ID = os.environ.get("PANEL_INBOUND_ID", "")
-SUB_HOST = os.environ.get("PANEL_SUBSCRIPTION_HOST", PANEL_URL).rstrip("/")
+
+
+def _panel_scheme_host(url):
+    """فقط scheme+دامنه رو برمی‌گردونه، بدون مسیر سفارشی (مثل /managepanel)."""
+    parsed = urllib.parse.urlsplit(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+# لینک اشتراک نباید مسیر سفارشی پنل (مثل /managepanel) رو داشته باشه —
+# فقط دامنه لازمه. اگه PANEL_SUBSCRIPTION_HOST دستی ست شده باشه همون رو
+# استفاده می‌کنیم، وگرنه از دامنه‌ی PANEL_URL می‌سازیم (بدون مسیر اضافه).
+SUB_HOST = os.environ.get("PANEL_SUBSCRIPTION_HOST", "").rstrip("/") or _panel_scheme_host(PANEL_URL)
 
 
 # نسخه‌های مختلف پنل، مسیر پایه‌ی API متفاوتی دارن:
@@ -178,6 +189,47 @@ def list_clients(inbound):
     settings = safe_json(inbound.get("settings"))
     return settings.get("clients", [])
 
+def get_client_stats_map(inbound):
+    """
+    پنل جدا از settings.clients (که فقط کانفیگه)، یه لیست دیگه به اسم
+    clientStats داره که آمار مصرف واقعی (up/down/total) و enable رو داره.
+    این تابع اون‌ها رو بر اساس email توی یه دیکشنری قابل جستجو برمی‌گردونه.
+    """
+    stats = inbound.get("clientStats") or []
+    return {s.get("email"): s for s in stats}
+
+def format_bytes(n):
+    try:
+        n = float(n or 0)
+    except (TypeError, ValueError):
+        return "0B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+def toggle_client_enable(inbound, email):
+    """
+    وضعیت فعال/غیرفعال یه کلاینت رو برعکس می‌کنه و توی پنل ذخیره می‌کنه.
+    از همون endpoint ای که add/remove استفاده می‌کنن استفاده می‌کنه
+    (این پنل با فرستادن کل settings جواب می‌ده، نه با endpoint جدا).
+    """
+    settings = safe_json(inbound.get("settings"))
+    clients = settings.get("clients", [])
+    target = None
+    for c in clients:
+        if c.get("email") == email:
+            c["enable"] = not c.get("enable", True)
+            target = c
+            break
+    if target is None:
+        return None
+    settings["clients"] = clients
+    payload = {"id": inbound.get("id"), "settings": json.dumps(settings)}
+    r = api_post("inbounds/addClient", payload)
+    return target if r.get("success", False) else None
+
 # ───────────────────────── ساخت لینک vless ─────────────────────────
 def build_vless_link(inbound, client, host_override=None):
     port = inbound.get("port", 443)
@@ -290,6 +342,26 @@ def send_message(chat_id, text, reply_to=None):
         d["reply_to_message_id"] = reply_to
     return tg("sendMessage", d)
 
+def send_message_with_keyboard(chat_id, text, keyboard, reply_to=None):
+    d = {"chat_id": chat_id, "text": text, "reply_markup": keyboard}
+    if reply_to:
+        d["reply_to_message_id"] = reply_to
+    return tg("sendMessage", d)
+
+def edit_message_keyboard(chat_id, message_id, keyboard):
+    return tg("editMessageReplyMarkup", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": keyboard,
+    })
+
+def answer_callback(cq_id, text=None, alert=False):
+    d = {"callback_query_id": cq_id}
+    if text:
+        d["text"] = text
+        d["show_alert"] = alert
+    return tg("answerCallbackQuery", d)
+
 def send_photo(chat_id, photo_path, caption=None, reply_to=None):
     import mimetypes
     boundary = "----xuibotboundary"
@@ -329,6 +401,29 @@ def generate_qr(text, path="/tmp/qr.png"):
         return None
 
 # ───────────────────────── دستورات ─────────────────────────
+def build_client_keyboard(inbound):
+    """
+    برای هر کاربر یه دکمه می‌سازه: 🟢/🔴 + نام + حجم مصرفی/کل.
+    زدن دکمه، وضعیت فعال/غیرفعال رو برعکس می‌کنه.
+    """
+    stats_map = get_client_stats_map(inbound)
+    clients = list_clients(inbound)
+    rows = []
+    for c in clients:
+        email = c.get("email", "?")
+        stat = stats_map.get(email, {})
+        enabled = stat.get("enable", c.get("enable", True))
+        used = (stat.get("up", 0) or 0) + (stat.get("down", 0) or 0)
+        total = stat.get("total") or c.get("totalGB", 0) or 0
+        vol_text = f"{format_bytes(used)}/{format_bytes(total) if total else '∞'}"
+        circle = "🟢" if enabled else "🔴"
+        label = f"{circle} {email} — {vol_text}"
+        rows.append([{
+            "text": label,
+            "callback_data": f"tgl|{inbound.get('id')}|{email}"[:64],
+        }])
+    return {"inline_keyboard": rows}
+
 def cmd_adduser(msg, args):
     chat_id = msg["chat"]["id"]
     reply_to = msg.get("message_id")
@@ -387,13 +482,9 @@ def cmd_list(msg, args):
         if not clients:
             send_message(chat_id, "هیچ کاربری نیست.", reply_to)
             return
-        lines = [f"👥 تعداد کاربران: {len(clients)}\n"]
-        for c in clients:
-            exp = ""
-            if c.get("expiryTime"):
-                exp = (datetime.fromtimestamp(c["expiryTime"]/1000) - datetime.now()).days
-            lines.append(f"• {c.get('email')} — باقی‌مانده: {exp} روز")
-        send_message(chat_id, "\n".join(lines), reply_to)
+        kb = build_client_keyboard(ib)
+        text = f"👥 تعداد کاربران: {len(clients)}\nبرای فعال/غیرفعال کردن روی دکمه بزنید:"
+        send_message_with_keyboard(chat_id, text, kb, reply_to)
     except Exception as e:
         traceback.print_exc()  # جزئیات کامل خطا توی لاگ Railway چاپ میشه
         send_message(chat_id, f"❌ خطا: {e}", reply_to)
@@ -413,7 +504,11 @@ def cmd_info(msg, args):
             if c.get("email") == name:
                 link = build_vless_link(ib, c)
                 sub = build_subscription_url(c.get("subId", ""))
-                send_message(chat_id, format_user_output(c, link, sub), reply_to)
+                stat = get_client_stats_map(ib).get(name, {})
+                used = (stat.get("up", 0) or 0) + (stat.get("down", 0) or 0)
+                enabled = stat.get("enable", c.get("enable", True))
+                extra = f"\n📈 مصرف‌شده: {format_bytes(used)}\n{'🟢 فعال' if enabled else '🔴 غیرفعال'}"
+                send_message(chat_id, format_user_output(c, link, sub) + extra, reply_to)
                 return
         send_message(chat_id, f"❌ کاربر {name} پیدا نشد.", reply_to)
     except Exception as e:
@@ -426,12 +521,60 @@ def cmd_help(msg, args):
         "🤖 دستورات ربات پنل 3x-ui:\n\n"
         "/adduser <نام> <حجم_GB> <روز> — ساخت کاربر جدید\n"
         "/deluser <نام> — حذف کاربر\n"
-        "/list — لیست کاربران\n"
+        "/list — لیست کاربران (با دکمه فعال/غیرفعال)\n"
         "/info <نام> — اطلاعات کاربر\n"
         "/help — همین راهنما\n\n"
         "فقط ادمین‌ها مجاز هستند."
     )
     send_message(chat_id, text, msg.get("message_id"))
+
+def handle_callback_query(cq):
+    """
+    وقتی روی یکی از دکمه‌های شیشه‌ای زیر /list کلیک میشه، تلگرام یه
+    آپدیت از نوع callback_query می‌فرسته (نه message). این تابع
+    وضعیت کلاینت رو توی پنل عوض می‌کنه و دکمه رو آپدیت می‌کنه.
+    """
+    cq_id = cq.get("id")
+    user = cq.get("from", {})
+    uid = user.get("id")
+    data = cq.get("data", "")
+    msg = cq.get("message", {}) or {}
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+
+    if not is_admin(uid):
+        answer_callback(cq_id, "⛔ شما ادمین نیستید", alert=True)
+        return
+
+    if not data.startswith("tgl|"):
+        answer_callback(cq_id)
+        return
+
+    try:
+        _, inbound_id, email = data.split("|", 2)
+        inbounds = get_inbounds()
+        ib = next((i for i in inbounds if str(i.get("id")) == str(inbound_id)), None)
+        if not ib:
+            answer_callback(cq_id, "❌ اینباند پیدا نشد", alert=True)
+            return
+
+        updated = toggle_client_enable(ib, email)
+        if updated is None:
+            answer_callback(cq_id, "❌ خطا در بروزرسانی وضعیت", alert=True)
+            return
+
+        state_text = "فعال شد ✅" if updated.get("enable") else "غیرفعال شد ⛔"
+        answer_callback(cq_id, f"{email}: {state_text}")
+
+        # کیبورد رو با وضعیت تازه دوباره می‌سازیم و پیام رو آپدیت می‌کنیم
+        inbounds2 = get_inbounds()
+        ib2 = next((i for i in inbounds2 if str(i.get("id")) == str(inbound_id)), None)
+        if ib2 and chat_id and message_id:
+            kb = build_client_keyboard(ib2)
+            edit_message_keyboard(chat_id, message_id, kb)
+    except Exception as e:
+        traceback.print_exc()
+        answer_callback(cq_id, f"❌ خطا: {e}", alert=True)
 
 # ───────────────────────── حلقه اصلی ─────────────────────────
 def main():
@@ -463,6 +606,14 @@ def main():
             updates = tg("getUpdates", {"offset": offset, "timeout": 30}, timeout=35)
             for u in updates.get("result", []):
                 offset = u["update_id"] + 1
+
+                if "callback_query" in u:
+                    cq = u["callback_query"]
+                    cq_from = cq.get("from", {})
+                    print(f"🔘 کلیک دکمه از {cq_from.get('id')}: {cq.get('data')!r}")
+                    handle_callback_query(cq)
+                    continue
+
                 if "message" not in u:
                     continue
                 msg = u["message"]
