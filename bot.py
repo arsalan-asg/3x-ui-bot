@@ -82,8 +82,14 @@ def _req(method, path, data=None, timeout=30):
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(url, data=body, headers=h, method=method)
     _ensure_opener()
-    with _opener.open(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    try:
+        with _opener.open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        # آدرس دقیق رو به پیام خطا اضافه می‌کنیم تا بدون نیاز به لاگ Railway
+        # بشه فهمید کدوم درخواست جواب نداده
+        e.msg = f"{e.msg} :: {url}"
+        raise
 
 def panel_login():
     """فقط وقتی توکن نیست صدا زده میشه."""
@@ -296,8 +302,12 @@ def tg(method, data=None, timeout=35):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     req = urllib.request.Request(url, data=json.dumps(data or {}).encode(),
                                   headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        e.msg = f"{e.msg} :: telegram/{method}"
+        raise
 
 def check_bot_token():
     """چک می‌کنه توکن بات معتبره و بهمون میگه بات چیه (برای دیباگ توی لاگ Railway)."""
