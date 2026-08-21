@@ -36,7 +36,17 @@ PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "")
 PANEL_INBOUND_ID = os.environ.get("PANEL_INBOUND_ID", "")
 SUB_HOST = os.environ.get("PANEL_SUBSCRIPTION_HOST", PANEL_URL).rstrip("/")
 
-API = f"{PANEL_URL}/xui/API"
+
+# نسخه‌های مختلف پنل، مسیر پایه‌ی API متفاوتی دارن:
+#   - x-ui قدیمی (vaxilu)      -> /xui/API/...
+#   - 3x-ui جدید (MHSanaei)    -> /panel/api/...
+# چون نمی‌دونیم کدومه، اول 3x-ui رو امتحان می‌کنیم و اگه با 404 مواجه شدیم
+# خودکار سراغ مسیر قدیمی می‌ریم و از اون به بعد همونو استفاده می‌کنیم.
+_api_base_candidates = [f"{PANEL_URL}/panel/api", f"{PANEL_URL}/xui/API"]
+_api_base_index = 0
+
+def API():
+    return _api_base_candidates[_api_base_index]
 
 # ───────────────────────── ابزارهای HTTP ─────────────────────────
 _opener = None
@@ -49,7 +59,7 @@ def _ensure_opener():
         _opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_cj))
 
 def _req(method, path, data=None, timeout=30):
-    url = f"{API}/{path}"
+    url = f"{API()}/{path}"
     # اولویت: api_token در query string
     if PANEL_API_TOKEN:
         sep = "&" if "?" in url else "?"
@@ -68,10 +78,21 @@ def panel_login():
     _ensure_opener()
     _req("POST", "login", {"username": PANEL_USERNAME, "password": PANEL_PASSWORD})
 
+def _switch_api_base():
+    """اگه مسیر فعلی جواب نداد، مسیر دیگه رو امتحان کن."""
+    global _api_base_index
+    if _api_base_index < len(_api_base_candidates) - 1:
+        _api_base_index += 1
+        print(f"⚠️ مسیر API عوض شد به: {API()}")
+        return True
+    return False
+
 def api_get(path):
     try:
         return _req("GET", path)
     except urllib.error.HTTPError as e:
+        if e.code == 404 and _switch_api_base():
+            return api_get(path)
         if e.code in (401, 403) and not PANEL_API_TOKEN:
             panel_login()
             return _req("GET", path)
@@ -81,6 +102,8 @@ def api_post(path, data):
     try:
         return _req("POST", path, data)
     except urllib.error.HTTPError as e:
+        if e.code == 404 and _switch_api_base():
+            return api_post(path, data)
         if e.code in (401, 403) and not PANEL_API_TOKEN:
             panel_login()
             return _req("POST", path, data)
@@ -88,7 +111,7 @@ def api_post(path, data):
 
 # ───────────────────────── توابع پنل ─────────────────────────
 def get_inbounds():
-    r = api_get("inbounds")
+    r = api_get("inbounds/list")
     return r.get("obj", [])
 
 def find_default_inbound(inbounds):
@@ -198,12 +221,46 @@ def format_user_output(client, link, sub_url):
     )
 
 # ───────────────────────── ربات تلگرام ─────────────────────────
-def tg(method, data):
+def tg(method, data=None, timeout=35):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    req = urllib.request.Request(url, data=json.dumps(data).encode(),
+    req = urllib.request.Request(url, data=json.dumps(data or {}).encode(),
                                   headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
+
+def check_bot_token():
+    """چک می‌کنه توکن بات معتبره و بهمون میگه بات چیه (برای دیباگ توی لاگ Railway)."""
+    try:
+        r = tg("getMe", timeout=15)
+        if r.get("ok"):
+            info = r["result"]
+            print(f"✅ توکن بات معتبره: @{info.get('username')}")
+            return True
+        else:
+            print(f"❌ توکن بات نامعتبره: {r}")
+            return False
+    except Exception as e:
+        print(f"❌ نمیشه به تلگرام وصل شد (توکن یا شبکه رو چک کنید): {e}")
+        return False
+
+def clear_webhook():
+    """
+    مهم‌ترین دلیل رایج «بات بالا میاد ولی جواب نمیده»:
+    اگه یه وبهوک روی این توکن ست شده باشه، getUpdates همیشه با خطای 409
+    مواجه میشه و بات هیچ‌وقت آپدیتی دریافت نمی‌کنه، بدون هیچ ارور واضحی.
+    این تابع در شروع کار، هر وبهوکی که ست شده رو پاک می‌کنه.
+    """
+    try:
+        info = tg("getWebhookInfo", timeout=15)
+        url = info.get("result", {}).get("url", "")
+        if url:
+            print(f"⚠️ یک وبهوک فعال پیدا شد ({url}) — در حال حذف...")
+            tg("deleteWebhook", {"drop_pending_updates": True}, timeout=15)
+            print("✅ وبهوک حذف شد. حالا getUpdates باید کار کنه.")
+        else:
+            print("✅ هیچ وبهوکی ست نشده — مسیر برای getUpdates بازه.")
+    except Exception as e:
+        print(f"❌ نتونستم وضعیت وبهوک رو چک کنم: {e}")
 
 def is_admin(uid):
     return uid in ADMIN_IDS
@@ -370,10 +427,17 @@ def main():
 
     mode = "API Token" if PANEL_API_TOKEN else "Username/Password"
     print(f"🤖 ربات پنل شروع شد | متد: {mode} | ادمین‌ها: {ADMIN_IDS}")
+
+    if not check_bot_token():
+        return
+    clear_webhook()
+
     offset = 0
     while True:
         try:
-            updates = tg("getUpdates", {"offset": offset, "timeout": 30})
+            # نکته: تایم‌اوت urlopen (35) باید از تایم‌اوت long-poll (30) بیشتر باشه
+            # وگرنه دقیقاً همون لحظه‌ای که تلگرام می‌خواد جواب بده Read timeout می‌گیریم.
+            updates = tg("getUpdates", {"offset": offset, "timeout": 30}, timeout=35)
             for u in updates.get("result", []):
                 offset = u["update_id"] + 1
                 if "message" not in u:
@@ -381,7 +445,10 @@ def main():
                 msg = u["message"]
                 text = msg.get("text", "")
                 user = msg.get("from", {})
-                if not is_admin(user.get("id")):
+                uid = user.get("id")
+                print(f"📩 پیام از {uid} ({user.get('username','?')}): {text!r}")
+                if not is_admin(uid):
+                    print(f"⛔ {uid} ادمین نیست. ADMIN_IDS فعلی: {ADMIN_IDS}")
                     continue
                 if not text.startswith("/"):
                     continue
