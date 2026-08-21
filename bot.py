@@ -18,6 +18,7 @@ XUI Panel Bot — ربات مدیریت پنل 3x-ui (sanaei) - آخرین نس�
 
 import os
 import json
+import traceback
 import time
 import uuid
 import urllib.request
@@ -143,7 +144,7 @@ def find_default_inbound(inbounds):
     return inbounds[0] if inbounds else None
 
 def add_client(inbound, email, total_gb, days, limit_ip=0):
-    settings = json.loads(inbound.get("settings", "{}"))
+    settings = safe_json(inbound.get("settings"))
     clients = settings.get("clients", [])
     client_id = str(uuid.uuid4())
     sub_id = str(uuid.uuid4()).replace("-", "")[:16]
@@ -166,7 +167,7 @@ def add_client(inbound, email, total_gb, days, limit_ip=0):
     return r.get("success", False), new_client, sub_id
 
 def remove_client(inbound, email):
-    settings = json.loads(inbound.get("settings", "{}"))
+    settings = safe_json(inbound.get("settings"))
     clients = [c for c in settings.get("clients", []) if c.get("email") != email]
     settings["clients"] = clients
     payload = {"id": inbound.get("id"), "settings": json.dumps(settings)}
@@ -174,13 +175,13 @@ def remove_client(inbound, email):
     return r.get("success", False)
 
 def list_clients(inbound):
-    settings = json.loads(inbound.get("settings", "{}"))
+    settings = safe_json(inbound.get("settings"))
     return settings.get("clients", [])
 
 # ───────────────────────── ساخت لینک vless ─────────────────────────
 def build_vless_link(inbound, client, host_override=None):
     port = inbound.get("port", 443)
-    stream = json.loads(inbound.get("streamSettings", "{}"))
+    stream = safe_json(inbound.get("streamSettings"))
     net = stream.get("network", "tcp")
     security = stream.get("security", "none")
     host = host_override or PANEL_URL.replace("https://", "").replace("http://", "").split("/")[0]
@@ -355,6 +356,7 @@ def cmd_adduser(msg, args):
         if qr_path:
             send_photo(chat_id, qr_path, caption="📱 QR کد کانفیگ", reply_to=reply_to)
     except Exception as e:
+        traceback.print_exc()  # جزئیات کامل خطا توی لاگ Railway چاپ میشه
         send_message(chat_id, f"❌ خطا: {e}", reply_to)
 
 def cmd_deluser(msg, args):
@@ -372,6 +374,7 @@ def cmd_deluser(msg, args):
         else:
             send_message(chat_id, f"❌ کاربر {name} پیدا نشد یا حذف نشد.", reply_to)
     except Exception as e:
+        traceback.print_exc()  # جزئیات کامل خطا توی لاگ Railway چاپ میشه
         send_message(chat_id, f"❌ خطا: {e}", reply_to)
 
 def cmd_list(msg, args):
@@ -392,6 +395,7 @@ def cmd_list(msg, args):
             lines.append(f"• {c.get('email')} — باقی‌مانده: {exp} روز")
         send_message(chat_id, "\n".join(lines), reply_to)
     except Exception as e:
+        traceback.print_exc()  # جزئیات کامل خطا توی لاگ Railway چاپ میشه
         send_message(chat_id, f"❌ خطا: {e}", reply_to)
 
 def cmd_info(msg, args):
@@ -413,6 +417,7 @@ def cmd_info(msg, args):
                 return
         send_message(chat_id, f"❌ کاربر {name} پیدا نشد.", reply_to)
     except Exception as e:
+        traceback.print_exc()  # جزئیات کامل خطا توی لاگ Railway چاپ میشه
         send_message(chat_id, f"❌ خطا: {e}", reply_to)
 
 def cmd_help(msg, args):
