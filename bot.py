@@ -110,6 +110,24 @@ def api_post(path, data):
         raise
 
 # ───────────────────────── توابع پنل ─────────────────────────
+def safe_json(val, default=None):
+    """
+    بعضی نسخه‌های پنل، فیلدهایی مثل settings/streamSettings رو به‌صورت
+    رشته‌ی JSON برمی‌گردونن، بعضی‌ها به‌صورت آبجکت/دیکشنری آماده.
+    این تابع هر دو حالت رو پشتیبانی می‌کنه.
+    """
+    if val is None:
+        return default if default is not None else {}
+    if isinstance(val, (dict, list)):
+        return val
+    if isinstance(val, (bytes, bytearray)):
+        val = val.decode()
+    if isinstance(val, str):
+        if not val.strip():
+            return default if default is not None else {}
+        return json.loads(val)
+    return default if default is not None else {}
+
 def get_inbounds():
     r = api_get("inbounds/list")
     return r.get("obj", [])
